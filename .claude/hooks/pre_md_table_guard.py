@@ -1,0 +1,260 @@
+"""PreToolUse hook (Write|Edit): deny Markdown table column-count breakage.
+
+GFM pipe tables only render when the header row's cell count equals the
+delimiter row's. This hook denies a Write/Edit that would introduce (or
+worsen) that mismatch in a .md file.
+
+- Write: analyze tool_input.content directly.
+- Edit: apply old_string -> new_string (respecting replace_all) to the
+  current on-disk content in memory, then analyze the result. This is
+  regression-only: only denies when the edit INCREASES the number of
+  CRITICAL (header != delimiter) findings versus the pre-edit file, so an
+  unrelated edit to an already-broken file is never blocked.
+
+Fail-open: any error -> exit 0 (never blocks on our own bug).
+
+Dedup rule: the global copy (~/.claude/hooks/) steps aside ONLY when the
+project both ships a repo-local copy AND registers it in the project's
+.claude/settings(.local).json. A merely-deployed-but-unregistered local copy
+(the normal state of governed repos, where the local file mainly serves CI)
+must NOT silence the global hook — that was a real protection gap found in
+QC on 2026-07-14: the old check deferred on file existence alone, which
+deactivated the hook layer in exactly the 44 deployed repos.
+
+Deployed from claude-governance/templates/hooks/ — edit there, not here.
+
+CALIBRATION (measured 2026-09-04, not chosen)
+---------------------------------------------
+Fired on 1 of 600 real Write/Edit calls replayed from 27 production
+transcripts = 0.17%. Very low, as expected for a regression-only guard
+that denies only when an edit INCREASES header/delimiter column-count
+mismatches versus the pre-edit file -- most Write/Edit calls are not even
+against .md tables, and among those that are, most do not worsen an
+existing mismatch.
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from firing_log import record as _record_firing
+except Exception:
+    def _record_firing(*_a, **_k):
+        return False
+
+try:
+    from codex_adapter import normalize as _codex_normalize
+except Exception:  # adapter missing: say so, do not fail silently
+    def _codex_normalize(d):
+        # A hook that cannot convert Codex payloads reads empty values and
+        # returns early -- silence indistinguishable from "no violation".
+        # One line on stderr keeps a broken deployment visible (QC
+        # 2026-09-18). stderr does not affect the hook's decision.
+        if isinstance(d, dict) and d.get("tool_name") == "apply_patch":
+            sys.stderr.write(
+                "[%s] codex_adapter.py not found next to this hook; "
+                "Codex apply_patch payloads are NOT being checked."
+                % os.path.basename(__file__) + chr(10))
+        return d
+
+
+# --- Codex blocking contract (F10g, 2026-09-18) -----------------------------
+# Claude Code blocks on stdout JSON + exit 0. Codex blocks ONLY on exit code 2
+# with the reason on stderr; its binary carries the string "PreToolUse hook
+# exited with code 2 but did not write a blocking reason to stderr", and its
+# TUI shows "Hook failed" (not "Blocked by hook") for anything else.
+#
+# Measured: these guards fired 28 times against a future-dated file under Codex
+# and the file was written anyway. The guard was right; the decision was
+# discarded. So "the hook fired" was never evidence of enforcement.
+#
+# Rather than edit each deny site (several sit inside `try/except: pass`, which
+# would swallow a SystemExit), capture stdout and translate at process exit.
+_CODEX_EXIT2_INSTALLED = True
+if True:
+    import atexit as _atexit
+    import io as _io
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    class _TeeOut(_io.TextIOBase):
+        """Pass stdout through while keeping a copy for the exit translator."""
+
+        def __init__(self, real):
+            self._real = real
+            self.buf = []
+
+        def write(self, s):
+            self.buf.append(s)
+            try:
+                return self._real.write(s)
+            except ValueError:
+                # Interpreter shutdown can close the real stream before this
+                # object is finalized. Keep buffering so the exit translator
+                # still sees the decision; never raise from write().
+                return len(s)
+
+        def flush(self):
+            # Called during interpreter finalization too, where the underlying
+            # stream may already be closed. A raise here surfaces as
+            # "Exception ignored in: <_TeeOut object>" noise on stderr, which
+            # under Codex is exactly where a blocking reason is read from.
+            try:
+                self._real.flush()
+            except ValueError:
+                pass
+
+    def _under_codex():
+        if _os.environ.get("CLAUDE_HOOK_RUNTIME") == "claude":
+            return False
+        if _os.environ.get("CODEX_HOOK_RUNTIME") == "codex":
+            return True
+        return bool(_os.environ.get("CODEX_HOME"))
+
+    _tee = _TeeOut(_sys.stdout)
+    _sys.stdout = _tee
+
+    def _codex_exit2():
+        _sys.stdout = _tee._real
+        if not _under_codex():
+            return
+        text = "".join(_tee.buf)
+        reason = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = _json.loads(line)
+            except Exception:
+                continue
+            hso = d.get("hookSpecificOutput") or {}
+            if hso.get("permissionDecision") == "deny":
+                reason = hso.get("permissionDecisionReason") or "blocked"
+                break
+        if reason is None:
+            return
+        try:
+            _sys.stderr.write(reason + _os.linesep)
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(2)   # bypass further atexit handlers and any except: pass
+
+    _atexit.register(_codex_exit2)
+# --- end Codex blocking contract -------------------------------------------
+
+
+def _registered_local_copy_exists():
+    """True only if a DIFFERENT repo-local copy exists AND is registered in
+    the project's .claude/settings.json or .claude/settings.local.json.
+    Any doubt (unreadable settings, missing file) -> False, i.e. we run the
+    check: protection wins over dedup."""
+    try:
+        me = os.path.abspath(__file__)
+        base = os.path.basename(__file__)
+        local = os.path.abspath(os.path.join(os.getcwd(), ".claude", "hooks", base))
+        if me == local or not os.path.exists(local):
+            return False
+        for name in ("settings.json", "settings.local.json"):
+            try:
+                with open(os.path.join(os.getcwd(), ".claude", name), encoding="utf-8-sig") as f:
+                    if base in f.read():
+                        return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+
+def main():
+    if _registered_local_copy_exists():
+        return
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import md_table_check  # noqa: E402
+    except Exception:
+        return
+
+    try:
+        raw = sys.stdin.buffer.read()
+        data = _codex_normalize(json.loads(raw.decode("utf-8", "replace")))
+        tool_name = data.get("tool_name") or ""
+        tool_input = data.get("tool_input") or {}
+        fp = tool_input.get("file_path") or ""
+
+        if not fp.lower().endswith(".md"):
+            return
+
+        if tool_name == "Write":
+            content = tool_input.get("content") or ""
+            criticals, _warnings = md_table_check.analyze_text(content)
+            if criticals:
+                c = criticals[0]
+                # 発火記録: 無反応と故障を区別するため(CLAUDE.md §14 F2)。ledger が読む
+                _record_firing("pre_md_table_guard", data)
+                _deny(c)
+            return
+
+        if tool_name == "Edit":
+            old_string = tool_input.get("old_string")
+            new_string = tool_input.get("new_string")
+            replace_all = bool(tool_input.get("replace_all"))
+            if old_string is None or new_string is None:
+                return
+
+            try:
+                with open(fp, encoding="utf-8-sig") as f:
+                    before_content = f.read()
+            except Exception:
+                before_content = ""
+
+            criticals_before, _ = md_table_check.analyze_text(before_content)
+
+            if replace_all:
+                after_content = before_content.replace(old_string, new_string)
+            else:
+                after_content = before_content.replace(old_string, new_string, 1)
+
+            criticals_after, _ = md_table_check.analyze_text(after_content)
+
+            if len(criticals_after) > len(criticals_before):
+                # find a finding present after but not clearly before (best-effort: just report first)
+                c = criticals_after[0]
+                # 発火記録: 無反応と故障を区別するため(CLAUDE.md §14 F2)。ledger が読む
+                _record_firing("pre_md_table_guard", data)
+                _deny(c)
+            return
+    except Exception:
+        pass
+
+
+def _deny(c):
+    if c["sep"] == 0:
+        reason = (
+            f"MDテーブルが描画されない: 行{c['line']} の区切り行の直後に本文行が無い"
+            f"（表「{c['cell']}」）。区切り行と最初の本文行の間の空行を削除してから保存。"
+        )
+    else:
+        reason = (
+            f"MDテーブル列数不一致: 行{c['line']} ヘッダー{c['header']}列≠区切り行{c['sep']}列"
+            f"（先頭セル「{c['cell']}」）。区切り行の `---` セルを{c['header']}個に揃えてから保存。"
+        )
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)

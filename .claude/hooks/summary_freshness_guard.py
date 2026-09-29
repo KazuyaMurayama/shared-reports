@@ -1,0 +1,353 @@
+# -*- coding: utf-8 -*-
+"""Stop hook: a report update must refresh the opening, not just append.
+
+THE RULE (user, 2026-09-11)
+---------------------------
+「更新の指示をした時に更新箇所を追記するのがレポートの後半の章になっていたり、
+あるいは単純に新しく最後の章を追加していくというスタイル…全く妥当ではありません。
+むしろ更新では、重要な漏れ／改善余地を指摘していることが多く、重要な情報ほど
+手前に来る設計にすべきです。」
+
+WHY A Stop HOOK AND NOT PreToolUse
+-----------------------------------
+PreToolUse(Write|Edit) cannot see the write at all when the file is produced by
+a Bash heredoc or sed. This one diffs the DISK at end of turn, so a write is
+caught regardless of which tool made it.
+
+HONEST CORRECTION (adversarial QC, 2026-09-11). This docstring used to say
+"0 of 3 report writes went through Write|Edit" and "every write path is covered
+by construction". Both were wrong:
+
+  * The 0-of-3 figure was one session. Across 770 real transcripts the .md
+    writes are Write 916 / Edit 3,614 / Bash 621 -- Bash is ~12%, not 100%.
+  * "Covered by construction" was false because coverage depends on the
+    SNAPSHOT seeing the path, and it was resolving relative paths against the
+    hook's own cwd. 63% of Bash .md writes are relative-after-`cd` and 6% are
+    MSYS `/c/...`; the path regex also stopped at ァ-ヶ, so 「投資・不動産」 --
+    the user's main tree -- was 100% invisible. Fixed in the snapshot; see its
+    _bases()/_msys_to_win()/PATH_RE.
+
+A guard's own docstring overstating its coverage is the exact failure this
+repo exists to prevent, so the numbers above are the measured ones.
+
+The cost of Stop is that it reports after the fact rather than blocking the
+write. That is the right trade here: the invariant is about the SHAPE OF THE
+FINISHED TURN ("you touched the late body and left the opening stale"), which
+is not even knowable until the turn ends. A per-edit check would fire on the
+first Edit of a sequence that ends perfectly correct.
+
+HOW THE BASELINE IS TAKEN
+-------------------------
+`summary_freshness_snapshot.py` (PreToolUse, matcher Write|Edit|MultiEdit|Bash
+|PowerShell) records each in-scope report file's content the FIRST time the
+turn touches it, keyed by prompt_id. At Stop this compares that baseline with
+what is now on disk. Files with no baseline are skipped: without a "before"
+there is no update to judge, and a brand-new report is a different rule.
+
+WHAT IT REPORTS
+  I1 WARN  >= K lines changed outside the opening block, opening unchanged.
+  I2 INFO  sections the opening block never references (advisory; naming a
+           section is not summarising it, so this can never be a block).
+
+Warn, not deny. A Stop-block forces a re-answer, and the correct response to
+this finding is often a judgement call ("the appendix genuinely belongs late").
+Promote to deny per repo via .claude/report_quality.json once warn-mode shows a
+clean week -- the same path post_bash_guard and pre_report_quality_guard took.
+
+CALIBRATION, on git history as ground truth (337 real report updates, 43 repos):
+
+    the bare diff invariant, K=5        107/337 (31.8%)
+    + document must HAVE a summary       26/337 ( 7.7%)
+    + date-bump bypass closed            30/342 ( 8.8%)
+    + bulk-sweep exemption (bulk_min=3)  27/342 ( 7.9%)  <- SHIPPED
+    + late change must add a heading     14/337 ( 4.2%)  <- rejected
+
+7.9% is what this hook is held to; precision is ~18 of 26 by reading every
+flagged section. An earlier 30-file sample claimed 20.0% for the bare invariant
+and was simply wrong -- the full corpus says 31.8%. The 4.2% variant was
+rejected for reopening three bypasses (a bolded verdict line, a blockquote, a
+table row) that match how this author actually appends findings. See
+summary_freshness_check.py for the full tables, the worked examples, and why
+the vocabulary-based design that preceded all of this died at precision ~3/10.
+
+FAIL-OPEN: any exception -> silent exit 0.
+Deployed from claude-governance/templates/hooks/ -- edit there, not here.
+"""
+import io
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from firing_log import record as _record_firing
+except Exception:
+    def _record_firing(*_a, **_k):
+        return False
+
+try:
+    import summary_freshness_check as SFC
+except Exception:
+    SFC = None
+
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "state",
+                         "summary_freshness")
+
+
+def _cfg():
+    cfg = {"mode": "warn", "k": 5, "bulk_min": 3}
+    try:
+        p = os.path.join(os.getcwd(), ".claude", "report_quality.json")
+        with io.open(p, encoding="utf-8-sig") as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            if isinstance(user.get("summary_mode"), str):
+                cfg["mode"] = user["summary_mode"]
+            if isinstance(user.get("summary_k"), int):
+                cfg["k"] = user["summary_k"]
+            if isinstance(user.get("summary_bulk_min"), int):
+                cfg["bulk_min"] = user["summary_bulk_min"]
+    except Exception:
+        pass
+    return cfg
+
+
+def _sid(ev):
+    """Session id -- must match summary_freshness_snapshot._sid()."""
+    raw = str(ev.get("session_id") or ev.get("prompt_id") or "nosession")
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:60]
+
+
+def _turn_key(ev):
+    sid = _sid(ev)
+    raw = str(ev.get("prompt_id") or ev.get("session_id") or "")
+    return sid + "__" + re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:60]
+
+
+def _read(path):
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+# A turn's snapshots may be spread over several keys, and older ones are junk.
+SNAPSHOT_MAX_AGE_S = 6 * 3600
+
+
+def _load_snapshot(key, sid=None, ev_has_session=False):
+    """Baselines for this turn, merged across every key written recently.
+
+    ⛔ WHY NOT JUST key + ".json" (adversarial QC, 2026-09-11). prompt_id is
+    NOT stable for the length of a turn: a single agent run produced three
+    distinct values (4e960105 -> ca11b6ce -> dc3aee1d), because it changes per
+    injected user-role message, not per user utterance. So the snapshot written
+    at PreToolUse could sit under a different key than the one Stop looks up,
+    and the guard would find nothing and stay silent -- the "無反応は故障と区別
+    がつかない" failure (CLAUDE.md §14 F2). It also broke subagent-written
+    reports, which CLAUDE.md §8b C4 actively encourages.
+
+    Whether Stop's prompt_id matches PreToolUse's was NOT verifiable here, so
+    this does not depend on it either way: take the exact key if present, then
+    merge in any other snapshot file written in the last few hours. Merging is
+    safe because a stale entry can only mean "compared against an older
+    baseline", and each file's own first-touch rule still holds. Consumed files
+    are deleted so the next turn starts clean.
+    """
+    out = {}
+    if key:
+        out.update(_read(os.path.join(STATE_DIR, key + ".json")))
+    now = time.time()
+    try:
+        names = os.listdir(STATE_DIR)
+    except Exception:
+        return out
+    prefix = (sid or "") + "__"
+    unowned = []
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        p = os.path.join(STATE_DIR, n)
+        try:
+            age = now - os.path.getmtime(p)
+        except Exception:
+            continue
+        if age > SNAPSHOT_MAX_AGE_S:
+            try:
+                os.remove(p)            # garbage-collect abandoned turns
+            except Exception:
+                pass
+            continue
+        if sid and not n.startswith(prefix):
+            unowned.append(p)           # another session's -- or an unkeyed one
+            continue
+        for k, v in _read(p).items():
+            out.setdefault(k, v)        # earliest baseline wins
+
+    # Fall back only if this session owns NOTHING. PreToolUse and Stop do not
+    # necessarily carry the same identifiers -- a payload may omit session_id
+    # entirely, in which case the snapshot is prefixed by its prompt_id and no
+    # session prefix can ever match it. Staying silent there would be the
+    # failure this module exists to prevent, so prefer a possibly-wrong
+    # baseline over no check at all. A wrong baseline can only mis-measure how
+    # much changed; it cannot invent a stale opening.
+    # ...but ONLY when this Stop has no session_id of its own to match against.
+    #
+    # ⛔ The unconditional version was a new defect (adversarial QC round 2,
+    # reproduced 2/2). A session that touched no report at all would adopt
+    # ANOTHER session's snapshots and warn about a file it never opened --
+    # including a file the other session was still mid-edit on. An abandoned
+    # snapshot (Ctrl+C, no Stop) made every other session warn once per
+    # report-free turn for six hours. Noise like that is how a guard gets
+    # muted, and it was introduced by the fix for the opposite problem.
+    #
+    # With a session_id present, an empty result is the honest answer: this
+    # session touched nothing. Without one, we cannot tell whose snapshot is
+    # whose, and staying silent would be the worse failure.
+    if not out and not ev_has_session:
+        for p in unowned:
+            for k, v in _read(p).items():
+                out.setdefault(k, v)
+    return out
+
+
+def _consume(key, sid=None):
+    """Delete THIS SESSION's snapshots so the next turn starts clean.
+
+    ⛔ Scoped by session prefix (2026-09-15). The first version deleted every
+    file younger than 6h, so with two sessions running concurrently the first
+    to reach Stop wiped the other's baselines and that session never fired
+    again. Reproduced: A fires, B silent. Same "guard does not fire" class the
+    whole module exists to prevent -- introduced by the fix for F3.
+    """
+    prefix = (sid or "") + "__"
+    now = time.time()
+    try:
+        names = os.listdir(STATE_DIR)
+    except Exception:
+        return
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        if sid and not n.startswith(prefix):
+            continue                    # never touch another session's state
+        p = os.path.join(STATE_DIR, n)
+        try:
+            if now - os.path.getmtime(p) <= SNAPSHOT_MAX_AGE_S:
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def main():
+    # Defer to a registered repo-local copy (existing convention).
+    try:
+        me = os.path.abspath(__file__)
+        local = os.path.abspath(os.path.join(
+            os.getcwd(), ".claude", "hooks", os.path.basename(__file__)))
+        if me != local and os.path.exists(local):
+            return
+    except Exception:
+        return
+
+    if SFC is None:
+        return
+
+    try:
+        ev = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    except Exception:
+        return
+    if ev.get("stop_hook_active"):
+        return                      # already blocked once; never loop
+
+    cfg = _cfg()
+    if cfg.get("mode") == "off":
+        return
+
+    key = _turn_key(ev)
+    sid = _sid(ev)
+    snap = _load_snapshot(key, sid, bool(ev.get("session_id")))
+    _consume(key, sid)              # one turn, one judgement -- this session only
+    if not snap:
+        return                      # nothing touched this turn
+
+    findings = []
+    for path, before in snap.items():
+        if not isinstance(before, str):
+            continue
+        if not os.path.isfile(path):
+            continue
+        after = SFC.read_text(path)
+        f = SFC.analyze(before, after, k=cfg.get("k", 5))
+        if not f:
+            continue
+        unref = SFC.unreferenced_sections(after)
+        findings.append((path, f, unref))
+
+    if not findings:
+        return
+
+    # BULK-EDIT EXEMPTION (adversarial QC, measured: the single largest false
+    # positive class -- 40 of 76). A turn that rewrites the same late section
+    # across many generated reports is a mechanical sweep, not a buried
+    # finding: "全レポートの未説明の専門語を一括是正", an ASCII diagram replaced
+    # by a table across 24 files, a citation-tag pass. Asking the author to
+    # restate each of those in each opening is noise, and noise is how a guard
+    # gets muted. One or two reports in a turn is normal authoring; three is a
+    # sweep. Configurable, and set to 0 to disable.
+    bulk = cfg.get("bulk_min", 3)
+    if bulk and len(findings) >= bulk:
+        return
+
+    # 発火記録: 無反応と故障を区別するため(CLAUDE.md §14 F2)。ledger が読む
+    _record_firing("summary_freshness_guard", ev)
+
+    lines = []
+    for path, f, unref in findings[:3]:
+        rel = os.path.basename(path)
+        lines.append(
+            u"・%s: 冒頭ブロック(L1-L%d)は逐語で不変のまま、L%d 以降を %d 行変更"
+            % (rel, f["opening_end"], f["first_late_line"], f["outside"]))
+        if unref:
+            lines.append(
+                u"  冒頭が参照していない章: %s"
+                % ", ".join(u"§%s" % n for n, _t in unref[:6]))
+
+    body = u"\n".join(lines)
+    reason = (
+        u"⛔ 更新が後半だけに入り、冒頭の結論が古いままです。\n" + body +
+        u"\n\n更新で見つかった事項は「重要な漏れ・改善余地」であることが多く、"
+        u"最も手前に来るべきものです。末尾に章を足して終えないこと。\n"
+        u"冒頭ブロック（結論/サマリー）に今回の変更の要点を反映してから完了と"
+        u"すること。巻末の詳細は残してよい——冒頭に要点が無いことが問題です。\n"
+        u"※付録・出典など本当に巻末が正しい変更なら、このまま完了してよい。")
+
+    if cfg.get("mode") == "deny":
+        # ensure_ascii + binary write: several kanji end in byte 0x5C under
+        # CP932 (「表」= 0x95 0x5C) and corrupt JSON through a text stream.
+        out = json.dumps({"decision": "block", "reason": reason},
+                          ensure_ascii=True)
+        sys.stdout.buffer.write(out.encode("ascii"))
+        sys.stdout.buffer.flush()
+    else:
+        # Same CP932 hazard as the deny path above, and it really bit: the
+        # end-to-end test read this stream as UTF-8 and got mojibake, because
+        # sys.stderr on Windows encodes to the console codepage. Every kanji in
+        # the warning was unreadable in the terminal too. Write UTF-8 bytes.
+        try:
+            sys.stderr.buffer.write((reason + u"\n").encode("utf-8"))
+            sys.stderr.buffer.flush()
+        except Exception:
+            sys.stderr.write(reason.encode("ascii", "replace").decode() + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

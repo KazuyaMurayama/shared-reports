@@ -1,0 +1,217 @@
+"""PreToolUse hook (Grep|Read|Bash): block searches against a STALE report index.
+
+Why this exists (incident 2026-07-30):
+    index/REPORT_INDEX.md is bot-generated derived data, rebuilt every day on
+    main by .github/workflows/report-index.yml. A session branch cut from main
+    starts rotting immediately. A stale index answers keyword searches with
+    "0 hits", which is indistinguishable from "the report does not exist" —
+    so a false negative gets reported to the user as a verified fact.
+    That happened: a working tree 11 days behind main missed
+    deep-research/outputs/CLASSICS_READING_LIST_20260727.md and the user was
+    told the report did not exist.
+
+Mechanism: the index self-declares its build time on line 3
+("自動生成: YYYY-MM-DD HH:MM UTC / ..."). If that build is older than
+MAX_AGE_HOURS, any direct read/grep of the index files is denied and the
+caller is redirected to index/search_reports.py, which sources the index from
+origin/main and therefore cannot go stale. No subprocess, no network.
+
+Fail-open: any error -> exit 0. JSON deny only (never exit 2).
+Deployed from claude-governance/templates/hooks/ — edit there, not here.
+
+CALIBRATION (measured 2026-09-04, not chosen)
+---------------------------------------------
+Fired on 0 of 600 real Grep/Read/Bash calls replayed from 27 production
+transcripts = 0.00%. Zero firings in the replay -- which on its own is
+NOT evidence that the guard works. Per CLAUDE.md §14 F2 (「無反応は故障と
+区別がつかない」), silence cannot be told apart from a hook that early-
+returns on every payload, which is exactly how a guard died unnoticed on
+2026-08-04.
+
+RESOLVED by forcing a firing (2026-09-04): planted an index whose build
+timestamp was 200h old (MAX_AGE_HOURS = 48) in a scratch directory and
+sent a Read of index/REPORT_INDEX.md. The guard returned
+permissionDecision "deny" reporting 「index が 8.3 日前のビルドで古い」.
+So the 0.00% is the first reading (the index was fresh in all 27
+transcripts), not the second (dead code). The replay measures how often
+this fires in ordinary work; the forced firing is what proves it can.
+
+Both numbers are needed. A rate alone would have left the ambiguity in
+place, and this hook is precisely the kind that should almost never fire
+-- the index is rebuilt daily, so a stale one is an exception, not a
+routine event.
+"""
+import datetime as dt
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from firing_log import record as _record_firing
+except Exception:
+    def _record_firing(*_a, **_k):
+        return False
+
+MAX_AGE_HOURS = 48  # workflow runs daily; >48h means the working copy is behind
+INDEX_NAMES = ("report_index.md", "reports.json")
+SANCTIONED = ("search_reports.py", "origin/main:", "build_report_index.py")
+
+
+# --- Codex blocking contract (F10g, 2026-09-18) -----------------------------
+# Claude Code blocks on stdout JSON + exit 0. Codex blocks ONLY on exit code 2
+# with the reason on stderr; its binary carries the string "PreToolUse hook
+# exited with code 2 but did not write a blocking reason to stderr", and its
+# TUI shows "Hook failed" (not "Blocked by hook") for anything else.
+#
+# Measured: these guards fired 28 times against a future-dated file under Codex
+# and the file was written anyway. The guard was right; the decision was
+# discarded. So "the hook fired" was never evidence of enforcement.
+#
+# Rather than edit each deny site (several sit inside `try/except: pass`, which
+# would swallow a SystemExit), capture stdout and translate at process exit.
+_CODEX_EXIT2_INSTALLED = True
+if True:
+    import atexit as _atexit
+    import io as _io
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    class _TeeOut(_io.TextIOBase):
+        """Pass stdout through while keeping a copy for the exit translator."""
+
+        def __init__(self, real):
+            self._real = real
+            self.buf = []
+
+        def write(self, s):
+            self.buf.append(s)
+            try:
+                return self._real.write(s)
+            except ValueError:
+                # Interpreter shutdown can close the real stream before this
+                # object is finalized. Keep buffering so the exit translator
+                # still sees the decision; never raise from write().
+                return len(s)
+
+        def flush(self):
+            # Called during interpreter finalization too, where the underlying
+            # stream may already be closed. A raise here surfaces as
+            # "Exception ignored in: <_TeeOut object>" noise on stderr, which
+            # under Codex is exactly where a blocking reason is read from.
+            try:
+                self._real.flush()
+            except ValueError:
+                pass
+
+    def _under_codex():
+        if _os.environ.get("CLAUDE_HOOK_RUNTIME") == "claude":
+            return False
+        if _os.environ.get("CODEX_HOOK_RUNTIME") == "codex":
+            return True
+        return bool(_os.environ.get("CODEX_HOME"))
+
+    _tee = _TeeOut(_sys.stdout)
+    _sys.stdout = _tee
+
+    def _codex_exit2():
+        _sys.stdout = _tee._real
+        if not _under_codex():
+            return
+        text = "".join(_tee.buf)
+        reason = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = _json.loads(line)
+            except Exception:
+                continue
+            hso = d.get("hookSpecificOutput") or {}
+            if hso.get("permissionDecision") == "deny":
+                reason = hso.get("permissionDecisionReason") or "blocked"
+                break
+        if reason is None:
+            return
+        try:
+            _sys.stderr.write(reason + _os.linesep)
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(2)   # bypass further atexit handlers and any except: pass
+
+    _atexit.register(_codex_exit2)
+# --- end Codex blocking contract -------------------------------------------
+
+
+def targets_index(data):
+    ti = data.get("tool_input") or {}
+    blob = " ".join(str(ti.get(k) or "") for k in
+                    ("file_path", "path", "pattern", "glob", "command")).lower()
+    if not blob:
+        return False
+    if any(s in blob for s in SANCTIONED):
+        return False  # already fresh-sourced or is the indexer itself
+    return any(n in blob for n in INDEX_NAMES)
+
+
+def index_age_hours():
+    """Age of the working-tree index build, or None if undeterminable."""
+    path = os.path.join(os.getcwd(), "index", "REPORT_INDEX.md")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        head = [next(f, "") for _ in range(6)]
+    m = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})\s*UTC", "".join(head))
+    if not m:
+        return None
+    built = dt.datetime.strptime(f"{m.group(1)} {m.group(2)}:{m.group(3)}",
+                                "%Y-%m-%d %H:%M").replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - built).total_seconds() / 3600.0
+
+
+def main():
+    # If a same-named repo-local copy exists and we are the global copy, defer to it.
+    try:
+        me = os.path.abspath(__file__)
+        local = os.path.abspath(os.path.join(os.getcwd(), ".claude", "hooks",
+                                            os.path.basename(__file__)))
+        if me != local and os.path.exists(local):
+            return
+    except Exception:
+        pass
+
+    try:
+        # stdin はバイトで読んで UTF-8 復号する（cp932 既定で日本語 payload が落ちる。2026-09-15）
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+        if not targets_index(data):
+            return
+        age = index_age_hours()
+        if age is None or age <= MAX_AGE_HOURS:
+            return
+        # 発火記録: 無反応と故障を区別するため(CLAUDE.md §14 F2)。ledger が読む
+        _record_firing("pre_index_read_guard", data)
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"作業ツリーの index が {age / 24:.1f} 日前のビルドで古い（日次自動更新のはず）。"
+                    "この状態で検索すると『0件』と『存在しない』が区別できず、"
+                    "誤って『該当なし』と報告する事故になる（2026-07-30 の古典レポート見落とし）。"
+                    "代わりに origin/main から取得して検索する "
+                    "`python index/search_reports.py <キーワード>` を使うこと。"
+                    "作業ツリーを直接使うなら先に `git fetch origin main` して同期する。"
+                ),
+            }
+        }))
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)
