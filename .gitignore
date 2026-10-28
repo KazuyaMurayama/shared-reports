@@ -1,1 +1,5 @@
 .claude/.external_write_guard/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
