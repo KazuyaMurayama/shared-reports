@@ -114,6 +114,10 @@
           {
             "type": "command",
             "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/plain_language_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/feedback_carry_guard.py"
           }
         ]
       }
@@ -136,6 +140,10 @@
           {
             "type": "command",
             "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/request_ledger_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/feedback_carry_guard.py"
           }
         ]
       }
@@ -271,6 +279,15 @@
             "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/pre_index_read_guard.py"
           }
         ]
+      },
+      {
+        "matcher": "Agent|Task|SendMessage|Workflow|RemoteTrigger|CronCreate|ScheduleWakeup|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/feedback_carry_guard.py"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -338,6 +355,10 @@
           {
             "type": "command",
             "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/session_start_freshness.py"
+          },
+          {
+            "type": "command",
+            "command": "P=$(command -v python3 || command -v python) || exit 0; exec \"$P\" .claude/hooks/feedback_carry_guard.py"
           }
         ]
       }
